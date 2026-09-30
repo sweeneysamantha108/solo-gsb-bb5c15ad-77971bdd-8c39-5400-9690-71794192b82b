@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.concurrency import asynccontextmanager
 from pydantic import ValidationError
 
@@ -28,6 +28,9 @@ from .schemas import (
     ReviewPlanIn,
     ReviewPlanOut,
     ReviseTaskIn,
+    ScoreBatchBlockerOut,
+    ScoreBatchOut,
+    ScoreBatchPublishIn,
     ScoreEntryIn,
     SeatPlanIn,
     SeatPlanOut,
@@ -62,8 +65,10 @@ app = FastAPI(
         "面向已完成且可行任务的盲审分配，"
         "以及面向已完成且含 2~5 份平行卷的可行任务的考场卷别排布"
         "，以及面向已完成可行任务首个候选卷组的双评录分与仲裁"
+        "，以及面向已完成可行任务首个候选卷组的成绩批次发布"
+        "（单事务快照一次性冻结全批逐题有效分与总分）"
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -858,3 +863,115 @@ def get_paper_scores(task_id: int, paper: int, examinee_raw: str) -> PaperScoreS
     papers, _ = _scorable_paper(task_id, paper)
     examinee_id = _decode_id(examinee_raw, "考生标识")
     return _build_sheet(task_id, paper, examinee_id, papers[paper])
+
+
+# --------------------------------------------------------------------------- #
+# 成绩批次发布：单事务快照冻结全批逐题有效分与总分（只追加、历史批次不可变）
+# --------------------------------------------------------------------------- #
+def _decode_batch_id(batch_raw: str):
+    """解码路径中的批次标识；非 int/str 拒绝，空字符串批次标识同样拒绝。"""
+    batch_id = _decode_id(batch_raw, "批次标识")
+    if isinstance(batch_id, str) and not batch_id:
+        raise HTTPException(status_code=422, detail="批次标识不能为空字符串")
+    return batch_id
+
+
+@app.put(
+    "/api/tasks/{task_id}/papers/{paper}/score-batches/{batch_raw}",
+    response_model=ScoreBatchOut,
+    responses={
+        201: {"description": "批次首次冻结成功"},
+        200: {"description": "相同批次、相同名单的幂等重试，返回原冻结快照"},
+        409: {"description": "批次已存在但请求名单不一致（batch_conflict），不写入"},
+    },
+)
+def publish_score_batch(
+    task_id: int,
+    paper: int,
+    batch_raw: str,
+    payload: ScoreBatchPublishIn,
+    response: Response,
+) -> ScoreBatchOut:
+    """把首个候选卷组某卷上**一批考生**的当前有效成绩一次性冻结发布。
+
+    路径给出任务号、卷号（从 0 起）与批次标识；请求体给出考生名单
+    （非空、无重复，整数与字符串标识严格区分）。批次标识在同一任务及卷内
+    唯一，路径编码口径与考生标识相同：整数批次 ``7`` 写作 ``7``，字符串批次
+    ``"B1"`` 写作 ``%22B1%22``——整数 7 与字符串 "7" 是两个不同批次。
+
+    服务端在**单个写事务（BEGIN IMMEDIATE）的同一数据库快照**内读取名单内
+    每名考生该卷的全部录分行并逐题套用有效分口径：
+
+    - 每名考生的该卷**每题都有有效分**：整批一次性冻结（逐题有效分 + 总分，
+      总分口径与 GET 成绩单一致），返回 201；冻结只追加，此后改分或仲裁**不
+      改变**本批次，新批次才读取最新成绩；
+    - 任一人缺评或待仲裁：返回 **422**（code=scores_pending），``blockers``
+      逐人给出第一道未决题（question_id/reason/message），**整批回滚不发布**；
+    - **相同批次重试**（名单逐位置、逐标识完全一致）：返回 **200** 与原冻结
+      快照（published_at 等均为首次冻结值）；同批次但名单不一致：返回 **409**
+      （code=batch_conflict，附既有名单），不写入任何内容；
+    - 空名单 / 重复考生 / 非整数非字符串标识返回 422；任务不存在 404；任务
+      未完成或结果不可行、卷号越界返回 422。
+    """
+    papers, _ = _scorable_paper(task_id, paper)
+    batch_id = _decode_batch_id(batch_raw)
+
+    code, data = database.publish_score_batch(
+        task_id,
+        paper,
+        scoring.encode_id_key(batch_id),
+        [scoring.encode_id_key(x) for x in payload.examinee_ids],
+        papers[paper],
+    )
+    if code == "created":
+        response.status_code = 201
+    elif code == "exists":
+        response.status_code = 200
+    elif code == "conflict":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "批次已存在且本次请求名单与冻结名单不一致；"
+                    "历史批次不可修改，请改用新批次标识"
+                ),
+                "code": "batch_conflict",
+                "existing_examinee_ids": data,
+            },
+        )
+    else:  # pending
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "名单内存在缺评或待仲裁的考生，整批未发布；"
+                    "补齐后可凭相同批次标识重试"
+                ),
+                "code": "scores_pending",
+                "blockers": [
+                    ScoreBatchBlockerOut(**b).model_dump() for b in data
+                ],
+            },
+        )
+    return ScoreBatchOut(**data)
+
+
+@app.get(
+    "/api/tasks/{task_id}/papers/{paper}/score-batches/{batch_raw}",
+    response_model=ScoreBatchOut,
+)
+def get_score_batch(task_id: int, paper: int, batch_raw: str) -> ScoreBatchOut:
+    """按批次查询已发布的冻结成绩（逐考生逐题有效分与总分、冻结时刻、名单）。
+
+    返回的恒为发布时刻的快照：发布后的初评/复评改分与仲裁均不影响结果。
+    任务不存在返回 404；任务未完成/结果不可行/卷号越界返回 422；任务、卷号
+    有效但批次不存在返回 **404**（批次标识整数/字符串按编码严格区分）。
+    """
+    papers, _ = _scorable_paper(task_id, paper)
+    batch_id = _decode_batch_id(batch_raw)
+    data = database.get_score_batch(
+        task_id, paper, scoring.encode_id_key(batch_id)
+    )
+    if data is None:
+        raise HTTPException(status_code=404, detail="该任务该卷下批次不存在")
+    return ScoreBatchOut(**data)

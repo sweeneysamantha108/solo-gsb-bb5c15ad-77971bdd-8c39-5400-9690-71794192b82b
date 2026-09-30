@@ -30,7 +30,7 @@
 docker compose up --build        # 前台运行；加 -d 后台运行
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events 与 paper_scores 表），无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events、paper_scores、score_batches 与 score_batch_items 表），无需任何手动初始化。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -67,6 +67,8 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PUT`  | `/api/tasks/{task_id}/papers/{paper}/examinees/{examinee}/questions/{question}/scores` | 对已完成可行任务首个候选卷组录入/修改**初评或复评**分（乐观版本，持久化） |
 | `POST` | `/api/tasks/{task_id}/papers/{paper}/examinees/{examinee}/questions/{question}/arbitration` | 两评分相差超过 1 分时录入**仲裁分**（须携版本，改分即撤销旧仲裁） |
 | `GET`  | `/api/tasks/{task_id}/papers/{paper}/examinees/{examinee}/scores` | 同快照查询某考生某卷逐题两评分、有效分、版本与待处理原因 |
+| `PUT` | `/api/tasks/{task_id}/papers/{paper}/score-batches/{batch}` | **按批次发布成绩**：同一数据库快照内全员有效才一次性冻结全批逐题有效分与总分（201 新建 / 200 幂等重试 / 409 名单冲突 / 422 缺评待仲裁） |
+| `GET` | `/api/tasks/{task_id}/papers/{paper}/score-batches/{batch}` | 按批次查询**已冻结发布**的成绩快照（发布后改分/仲裁不改历史批次） |
 | `GET`  | `/health` | 健康检查 |
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。
@@ -1124,6 +1126,99 @@ curl -X POST http://localhost:8000/api/tasks/1/papers/0/examinees/42/questions/3
 ```
 
 录分结果持久化在 `paper_scores` 表（随 SQLite 数据卷保留，服务/容器重启不丢失）。任务不存在返回 404；任务未完成、无结果或结果不可行（`infeasible` / `error` / `quota_exceeded`）返回 422。
+
+## 成绩批次发布（`PUT .../papers/{paper}/score-batches/{batch}`）
+
+教研组把已完成可行任务**首个候选卷组**某卷上的一批考生成绩**按批次冻结发布**。请求给出任务号、卷号、批次标识与考生标识列表；服务端在**单个写事务（进程内互斥锁 + `BEGIN IMMEDIATE`）的同一数据库快照**内读取名单内每名考生该卷的全部录分行，逐题套用[有效分口径](#有效分与待处理原因)：
+
+- **仅当名单中每名考生的该卷所有题目都有有效分**时，才一次性冻结**全批**逐题有效分与总分并原子提交（HTTP **201**）——校验与冻结共用同一事务快照，不存在“校验时有效、冻结前被改分”的中间态；
+- **任一人缺评或待仲裁**：返回 HTTP **422**（`detail.code=scores_pending`），`blockers` 逐考生列出**第一道**未决题（`question_id` / `reason` / `message`，原因码与逐题成绩单一致），事务回滚，**整批不发布、不留批次痕迹**；补齐录分/仲裁后可凭**相同批次标识**重试。
+
+**标识规则（整数与字符串严格区分）**：路径中的批次标识与请求体中的考生标识沿用录分的 JSON 编码口径——整数直接写（`7`、`1001`），字符串写 URL 编码的 JSON 串（`"B1"` → `%22B1%22`，`"X7"` → `%22X7%22`）。**整数 7 与字符串 "7" 是两个不同批次；整数 1001 与字符串 "1001" 是两名不同考生**。考生名单不能为空、不能含重复标识（布尔、浮点、数组等非 int/str 标识一律 422）。批次标识在**同一任务及卷号内唯一**。
+
+**幂等、冲突与历史不可变**：
+
+| 情形 | 响应 |
+| --- | --- |
+| 批次不存在且全员有效 | **201**，冻结并返回快照 |
+| 同批次重试、名单**逐位置逐标识完全一致** | **200**，返回**原冻结快照**（`published_at` 等均为首次值） |
+| 同批次重试但名单不一致（含仅顺序不同） | **409**，`detail.code=batch_conflict`，附既有名单 `existing_examinee_ids`，不写入 |
+| 任一人缺评/待仲裁 | **422**，`detail.code=scores_pending` + `blockers`，整批回滚 |
+| 发布后改分或仲裁 | **不改变任何历史批次**；用**新批次标识**发布才会读取最新成绩 |
+
+> 重试一致性按请求名单判定：`[1001, 1002]` 与 `[1002, 1001]` 视为不同请求（409）；快照内逐考生结果始终按名单顺序返回。
+
+### 发布请求示例
+
+```bash
+# 批次 B1（字符串标识，路径写 %22B1%22）发布考生 1001、1002 当前有效成绩
+curl -X PUT "http://localhost:8000/api/tasks/1/papers/0/score-batches/%22B1%22" \
+  -H "Content-Type: application/json" \
+  -d '{"examinee_ids": [1001, 1002]}'
+```
+
+成功响应（201；只冻结逐题**有效分**与总分，有效分口径同 GET 成绩单）：
+
+```json
+{
+  "task_id": 1,
+  "paper": 0,
+  "batch_id": "B1",
+  "status": "frozen",
+  "examinee_ids": [1001, 1002],
+  "examinees": [
+    {"examinee_id": 1001,
+     "questions": [
+       {"question_id": 1, "effective_score": 4.5},
+       {"question_id": 2, "effective_score": 5},
+       {"question_id": 3, "effective_score": 3}],
+     "total_score": 12.5},
+    {"examinee_id": 1002,
+     "questions": [
+       {"question_id": 1, "effective_score": 2},
+       {"question_id": 2, "effective_score": 1.5},
+       {"question_id": 3, "effective_score": 4}],
+     "total_score": 7.5}
+  ],
+  "published_at": "2026-09-30T04:14:51Z"
+}
+```
+
+有人未评完时整批拒绝（422，不产生批次）：
+
+```json
+{"detail": {
+  "message": "名单内存在缺评或待仲裁的考生，整批未发布；补齐后可凭相同批次标识重试",
+  "code": "scores_pending",
+  "blockers": [
+    {"examinee_id": 1002, "question_id": 3,
+     "reason": "awaiting_arbitration",
+     "message": "初评与复评分差超过 1 分，等待仲裁"}
+  ]
+}}
+```
+
+批次已存在但名单不一致（409）：
+
+```json
+{"detail": {
+  "message": "批次已存在且本次请求名单与冻结名单不一致；历史批次不可修改，请改用新批次标识",
+  "code": "batch_conflict",
+  "existing_examinee_ids": [1001, 1002]
+}}
+```
+
+### 按批次查询（`GET .../papers/{paper}/score-batches/{batch}`）
+
+返回发布时刻冻结的名单、逐考生逐题有效分、总分与 `published_at`；发布之后的任何改分/仲裁都不影响结果。任务不存在返回 404；任务不可录分或卷号越界返回 422；任务、卷号有效但**批次不存在返回 404**（整数批次 `7` 与字符串批次 `"7"` 按编码分别查询）。
+
+```bash
+curl "http://localhost:8000/api/tasks/1/papers/0/score-batches/%22B1%22"
+# -> 200 与首次冻结完全相同的快照；不存在 -> 404 {"detail": "该任务该卷下批次不存在"}
+```
+
+批次数据持久化在 `score_batches`（批次头：名单与冻结时刻）与 `score_batch_items`（逐考生逐题有效分/总分快照）表中，随 SQLite 数据卷保留；批次记录只追加、永不更新或删除。
+
 
 ## 可行结果
 

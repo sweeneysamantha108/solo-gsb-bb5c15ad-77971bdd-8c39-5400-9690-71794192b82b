@@ -1101,3 +1101,111 @@ class PaperScoreSheetOut(BaseModel):
             "整卷总分：每题有效分求和；任一题尚无有效分（等待补评/仲裁）时为 null"
         ),
     )
+
+
+# --------------------------------------------------------------------------- #
+# 成绩批次发布（已完成可行任务首个候选卷组；同快照冻结逐题有效分与总分）
+# --------------------------------------------------------------------------- #
+BatchId = Union[int, str]
+
+
+def _validate_identifier(value: Any, what: str) -> Any:
+    """考生/批次标识校验：仅接受整数或字符串（布尔、浮点等一律拒绝）。
+
+    整数与字符串严格区分：1 与 "1" 是两个不同标识。空字符串批次标识无意义，
+    一并拒绝。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{what} 必须是整数或字符串（收到 {type(value).__name__}）")
+    if isinstance(value, str) and not value:
+        raise ValueError(f"{what} 不能为空字符串")
+    return value
+
+
+class ScoreBatchPublishIn(BaseModel):
+    """批次发布请求体：本批要发布成绩的考生名单（顺序即冻结快照中的返回顺序）。
+
+    - 每个考生标识必须是整数或字符串（布尔/浮点/数组等拒绝），整数 1 与字符串
+      "1" 视为不同考生；名单不能为空、不得含重复考生（按编码后的标识判重）；
+    - 批次标识在**路径**中给出（JSON 编码，口径与考生标识一致），同一任务及
+      卷号内唯一；同批次重试时名单必须与首次完全一致（逐位置、逐类型），否则
+      报 409 冲突。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    examinee_ids: List[ExamineeId] = Field(
+        ...,
+        min_length=1,
+        description="本批考生标识列表（非空；整数与字符串严格区分，不允许重复）",
+    )
+
+    @field_validator("examinee_ids", mode="before")
+    @classmethod
+    def _validate_examinee_ids(cls, values: Any) -> Any:
+        # before 模式在 lax 强转（True->1、1.0->1）之前拦截原始 JSON 值，
+        # 保证布尔/浮点无法伪装成整数标识
+        if not isinstance(values, list):
+            raise ValueError("examinee_ids 必须是考生标识数组")
+        seen: set[str] = set()
+        for value in values:
+            _validate_identifier(value, "考生标识")
+            key = json.dumps(value, ensure_ascii=False)
+            if key in seen:
+                raise ValueError(
+                    f"考生名单含重复考生 {value!r}（整数与字符串形式严格区分）"
+                )
+            seen.add(key)
+        return values
+
+
+class FrozenQuestionScoreOut(BaseModel):
+    """批次冻结快照中的单题有效分（只冻结有效分口径的结果，不冻结两评过程）。"""
+
+    question_id: QuestionId
+    effective_score: Union[int, float] = Field(
+        ..., description="冻结时刻的有效分（均值半分或仲裁分）；冻结后不随后续改分变化"
+    )
+
+
+class FrozenExamineeScoreOut(BaseModel):
+    """批次中某考生的冻结成绩单：逐题有效分与总分（发布时全卷必有有效分）。"""
+
+    examinee_id: ExamineeId
+    questions: List[FrozenQuestionScoreOut] = Field(
+        ..., description="逐题有效分（按首个候选卷组 selected_ids 顺序冻结）"
+    )
+    total_score: Union[int, float] = Field(..., description="冻结总分（逐题有效分求和）")
+
+
+class ScoreBatchOut(BaseModel):
+    """一次成绩批次发布的冻结结果；发布后改分/仲裁不改变本快照。"""
+
+    task_id: int
+    paper: int = Field(..., description="卷号（从 0 起，对应首个候选卷组的卷下标）")
+    batch_id: BatchId = Field(..., description="批次标识（同一任务及卷内唯一；整数与字符串严格区分）")
+    status: str = Field(
+        ..., description="批次状态：frozen（已一次性冻结发布）"
+    )
+    examinee_ids: List[ExamineeId] = Field(
+        ..., description="本批考生名单（按请求顺序冻结，重试一致性按此列表判定）"
+    )
+    examinees: List[FrozenExamineeScoreOut] = Field(
+        ..., description="逐考生冻结的逐题有效分与总分（顺序与 examinee_ids 一致）"
+    )
+    published_at: str = Field(..., description="冻结时刻（UTC ISO 8601，秒级，Z 结尾）")
+
+
+class ScoreBatchBlockerOut(BaseModel):
+    """整批不予发布时，名单中某考生阻碍发布的第一道未决题目。"""
+
+    examinee_id: ExamineeId
+    question_id: QuestionId
+    reason: str = Field(
+        ...,
+        description=(
+            "待处理原因码：no_scores / missing_initial / missing_review / "
+            "awaiting_arbitration（与逐题成绩单口径一致）"
+        ),
+    )
+    message: str = Field(..., description="原因中文说明")

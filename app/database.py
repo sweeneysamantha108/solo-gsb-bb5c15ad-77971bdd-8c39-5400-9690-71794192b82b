@@ -35,6 +35,14 @@ SHA-256，首事件前驱为 64 个 0（创世哈希）。校验时逐条重算�
 填空槽不动版本；改分与仲裁为乐观并发，必须携带当前版本，条件 UPDATE 命中
 后版本 +1，版本不符整句不命中、绝不写入；任何改分在同语句把仲裁分置空
 （旧仲裁立即撤销）。读取在单一只读事务快照内完成，查询所见严格同一时刻。
+
+成绩批次发布（score_batches / score_batch_items 表）：在**单个写事务**
+（进程内互斥锁 + BEGIN IMMEDIATE）的同一数据库快照内读取批次名单内每名
+考生该卷的全部录分行并逐题套用有效分口径——仅当每人每题均有有效分时才
+一次性插入批次头（同任务+卷内批次标识唯一）与逐考生逐题有效分/总分的
+冻结明细并原子提交；任一人缺评或待仲裁则回滚整事务，整批不发布。同批次
+重试名单一致返回原冻结快照，不一致报冲突且不写入；冻结只追加、永不更新，
+发布后的改分/仲裁不改变历史批次，新批次读取最新成绩。
 """
 from __future__ import annotations
 
@@ -170,6 +178,41 @@ def init_db() -> None:
                 prev_hash  TEXT NOT NULL,
                 hash       TEXT NOT NULL,
                 UNIQUE (task_id, seq)
+            )
+            """
+        )
+        # 成绩批次发布：score_batches 为批次头（同任务+卷内 batch_id 唯一），
+        # score_batch_items 为逐考生冻结快照。批次只在**单个 BEGIN IMMEDIATE
+        # 事务**中产生：该事务同一快照读取名单内每名考生该卷的全部录分行，
+        # 逐题套用有效分口径，仅当每人每题均有有效分时才插入批次头与全部明细，
+        # 任一人缺评或待仲裁则整事务回滚——绝无“半批发布”。
+        # batch_id / examinee_id 均为 JSON 编码（整数 1 与字符串 "1" 互不冲突）。
+        # examinees_json 冻结请求名单（顺序敏感，重试一致性按它判定）；
+        # items 行的 sheet_json 冻结逐题有效分与总分，发布后录分改动不影响历史批次。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS score_batches (
+                task_id       INTEGER NOT NULL,
+                paper         INTEGER NOT NULL,
+                batch_id      TEXT NOT NULL,
+                examinees_json TEXT NOT NULL,
+                published_at  TEXT NOT NULL,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (task_id, paper, batch_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS score_batch_items (
+                task_id     INTEGER NOT NULL,
+                paper       INTEGER NOT NULL,
+                batch_id    TEXT NOT NULL,
+                seq         INTEGER NOT NULL,
+                examinee_id TEXT NOT NULL,
+                sheet_json  TEXT NOT NULL,
+                PRIMARY KEY (task_id, paper, batch_id, seq),
+                UNIQUE (task_id, paper, batch_id, examinee_id)
             )
             """
         )
@@ -1262,6 +1305,194 @@ def get_paper_score_rows(
         ).fetchall()
         conn.commit()
         return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 成绩批次发布：单事务快照校验 + 一次性冻结（只追加，发布后不可变）
+# --------------------------------------------------------------------------- #
+def _batch_out(
+    conn: sqlite3.Connection,
+    task_id: int,
+    paper: int,
+    batch_key: str,
+    header: Optional[sqlite3.Row] = None,
+) -> Dict[str, Any]:
+    """在调用方事务/连接上读取批次头与逐考生明细，组装冻结快照输出。"""
+    if header is None:
+        header = conn.execute(
+            "SELECT task_id, paper, batch_id, examinees_json, published_at"
+            " FROM score_batches WHERE task_id = ? AND paper = ? AND batch_id = ?",
+            (task_id, paper, batch_key),
+        ).fetchone()
+    item_rows = conn.execute(
+        "SELECT sheet_json FROM score_batch_items"
+        " WHERE task_id = ? AND paper = ? AND batch_id = ? ORDER BY seq",
+        (task_id, paper, batch_key),
+    ).fetchall()
+    return {
+        "task_id": int(header["task_id"]),
+        "paper": int(header["paper"]),
+        "batch_id": json.loads(header["batch_id"]),
+        "status": "frozen",
+        "examinee_ids": json.loads(header["examinees_json"]),
+        "examinees": [json.loads(r["sheet_json"]) for r in item_rows],
+        "published_at": header["published_at"],
+    }
+
+
+def publish_score_batch(
+    task_id: int,
+    paper: int,
+    batch_key: str,
+    examinee_keys: List[str],
+    selected_ids: List[Any],
+) -> Tuple[str, Any]:
+    """在**单个写事务**内校验名单并一次性冻结全批成绩。
+
+    全程持进程内互斥锁 + BEGIN IMMEDIATE，与录分写操作互斥；校验读取与冻结
+    写入共用同一事务快照，杜绝“校验时有效、冻结前被改分”的中间态：
+
+    1. 批次已存在（同 task/paper/batch_id）：名单的规范化 JSON 与冻结名单逐
+       位置、逐标识一致 → 返回原快照（``exists``，幂等重试）；不一致 →
+       ``conflict``（附冻结名单，供 409 响应），不写入任何内容；
+    2. 批次不存在：同一快照读取名单内**全部**考生该卷的录分行，按题序逐题套用
+       有效分口径。任一考生任一缺评/待仲裁题都记入 blockers 并**回滚整事务**
+       （``pending``，整批不发布）；
+    3. 每人每题均有有效分：插入批次头与逐考生冻结明细（逐题有效分 + 总分），
+       随事务原子提交（``created``）。此后初评/复评改分或仲裁只影响
+       paper_scores，本批次快照永不改变。
+
+    ``examinee_keys`` / ``batch_key`` 均为 JSON 编码后的标识（整数 1 与字符串
+    "1" 严格区分）；``selected_ids`` 为首个候选卷组该卷的题号顺序。
+    """
+    from . import scoring  # 局部导入：复用既有有效分口径，保持层次单向
+
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = conn.execute(
+            "SELECT examinees_json FROM score_batches"
+            " WHERE task_id = ? AND paper = ? AND batch_id = ?",
+            (task_id, paper, batch_key),
+        ).fetchone()
+        incoming_ids = [json.loads(k) for k in examinee_keys]
+        incoming_canonical = _canonical_json(incoming_ids)
+        if existing is not None:
+            conn.commit()
+            if existing["examinees_json"] == incoming_canonical:
+                return "exists", _batch_out(conn, task_id, paper, batch_key)
+            return "conflict", json.loads(existing["examinees_json"])
+
+        # 同快照一次性读取名单内全部考生的录分行，再按考生分组
+        placeholders = ",".join("?" for _ in examinee_keys)
+        rows = conn.execute(
+            "SELECT examinee_id, question_id, initial_score, review_score,"
+            " arbitration_score, version"
+            " FROM paper_scores WHERE task_id = ? AND paper = ?"
+            f" AND examinee_id IN ({placeholders})",
+            [task_id, paper, *examinee_keys],
+        ).fetchall()
+        rows_by_examinee: Dict[str, Dict[str, sqlite3.Row]] = {}
+        for r in rows:
+            rows_by_examinee.setdefault(r["examinee_id"], {})[
+                json.loads(r["question_id"])
+            ] = r
+
+        blockers: List[Dict[str, Any]] = []
+        sheets: List[Dict[str, Any]] = []
+        for examinee_key in examinee_keys:
+            examinee_id = json.loads(examinee_key)
+            by_question = rows_by_examinee.get(examinee_key, {})
+            questions: List[Dict[str, Any]] = []
+            total: float = 0
+            blocked = False
+            for qid in selected_ids:
+                state = scoring.question_state(by_question.get(qid))
+                effective = state["effective_score"]
+                if effective is None:
+                    # 每名考生只报第一道未决题（题序即 selected_ids），整批随后回滚
+                    blockers.append(
+                        {
+                            "examinee_id": examinee_id,
+                            "question_id": qid,
+                            "reason": state["pending_reason"],
+                            "message": state["pending_message"],
+                        }
+                    )
+                    blocked = True
+                    break
+                questions.append({"question_id": qid, "effective_score": effective})
+                total += effective
+            if blocked:
+                continue
+            if float(total).is_integer():
+                total = int(total)
+            sheets.append(
+                {
+                    "examinee_id": examinee_id,
+                    "questions": questions,
+                    "total_score": total,
+                }
+            )
+
+        if blockers:
+            # 缺评或待仲裁：整批不发布，事务回滚不留任何批次痕迹
+            conn.rollback()
+            return "pending", blockers
+
+        published_at = _now_iso()
+        conn.execute(
+            "INSERT INTO score_batches"
+            " (task_id, paper, batch_id, examinees_json, published_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (task_id, paper, batch_key, incoming_canonical, published_at),
+        )
+        for seq, sheet in enumerate(sheets):
+            conn.execute(
+                "INSERT INTO score_batch_items"
+                " (task_id, paper, batch_id, seq, examinee_id, sheet_json)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    paper,
+                    batch_key,
+                    seq,
+                    scoring.encode_id_key(sheet["examinee_id"]),
+                    _canonical_json(sheet),
+                ),
+            )
+        conn.commit()
+        header = conn.execute(
+            "SELECT task_id, paper, batch_id, examinees_json, published_at"
+            " FROM score_batches WHERE task_id = ? AND paper = ? AND batch_id = ?",
+            (task_id, paper, batch_key),
+        ).fetchone()
+        return "created", _batch_out(conn, task_id, paper, batch_key, header)
+
+
+def get_score_batch(
+    task_id: int, paper: int, batch_key: str
+) -> Optional[Dict[str, Any]]:
+    """在单一只读事务快照中读取一个已发布批次（批次不存在返回 None）。"""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        header = conn.execute(
+            "SELECT task_id, paper, batch_id, examinees_json, published_at"
+            " FROM score_batches WHERE task_id = ? AND paper = ? AND batch_id = ?",
+            (task_id, paper, batch_key),
+        ).fetchone()
+        if header is None:
+            conn.commit()
+            return None
+        result = _batch_out(conn, task_id, paper, batch_key, header)
+        conn.commit()
+        return result
     except Exception:
         conn.rollback()
         raise
