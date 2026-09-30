@@ -20,6 +20,8 @@
 
 教研组还可对**已完成且可行**的任务**录分**（首个候选卷组，卷号从 0 起）：按 `(卷号, 考生标识, 题号)` 持久化**初评/复评**两轮整数分（0 至该题分值，仅允许该卷题目，整数与字符串题号/考生标识严格区分）。每题版本从 0 起——首次录分与缺轮补评不占版本；**改分与仲裁必须携带当前版本，成功后版本 +1，版本不符返回 409 冲突且不写入**，任何改分立即撤销旧仲裁。初评复评齐备且**相差不超过 1 分**时有效分自动取**均值**（差 1 为半分），否则等待补评或仲裁；**仲裁仅限两评分相差超过 1 分**。查询在同一快照返回逐题两评分、有效分、版本与待处理原因，**全卷每题均有有效分才返回总分**，详见下文[录分与仲裁](#录分与仲裁初评复评仲裁)。
 
+教研组还可把成绩**按批次发布**（`POST .../papers/{paper}/publications`）：提交任务、卷号、批次标识（同一任务及卷内唯一，整数与字符串严格区分）与考生标识名单；仅当名单中**每名**考生该卷**每题都有有效分**时，才在**同一数据库快照**内一次性冻结全批逐题有效分与总分——任一人缺评或待仲裁则返回逐人题号与原因、**整批不发布**。相同批次重试且名单一致时返回原快照（幂等），名单不一致报 **409 冲突**；发布后的改分/仲裁不影响历史批次，新批次在其发布时刻读取最新成绩；发布结果可按批次查询，任务/卷号/批次不存在均明确报错，空名单与重复考生一律拒绝，详见下文[成绩批次发布](#成绩批次发布)。
+
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
 
 ## 启动
@@ -30,7 +32,7 @@
 docker compose up --build        # 前台运行；加 -d 后台运行
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events 与 paper_scores 表），无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events、paper_scores、score_publications 与 score_publication_items 表），无需任何手动初始化。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -67,6 +69,8 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PUT`  | `/api/tasks/{task_id}/papers/{paper}/examinees/{examinee}/questions/{question}/scores` | 对已完成可行任务首个候选卷组录入/修改**初评或复评**分（乐观版本，持久化） |
 | `POST` | `/api/tasks/{task_id}/papers/{paper}/examinees/{examinee}/questions/{question}/arbitration` | 两评分相差超过 1 分时录入**仲裁分**（须携版本，改分即撤销旧仲裁） |
 | `GET`  | `/api/tasks/{task_id}/papers/{paper}/examinees/{examinee}/scores` | 同快照查询某考生某卷逐题两评分、有效分、版本与待处理原因 |
+| `POST` | `/api/tasks/{task_id}/papers/{paper}/publications` | 按批次**发布**某卷一批考生成绩（同快照全批校验通过才冻结；幂等重试） |
+| `GET`  | `/api/tasks/{task_id}/papers/{paper}/publications/{batch}` | 按批次查询冻结的发布结果（逐题有效分与总分，不随后续改分变化） |
 | `GET`  | `/health` | 健康检查 |
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。
@@ -1124,6 +1128,114 @@ curl -X POST http://localhost:8000/api/tasks/1/papers/0/examinees/42/questions/3
 ```
 
 录分结果持久化在 `paper_scores` 表（随 SQLite 数据卷保留，服务/容器重启不丢失）。任务不存在返回 404；任务未完成、无结果或结果不可行（`infeasible` / `error` / `quota_exceeded`）返回 422。
+
+## 成绩批次发布
+
+教研组可把**已完成且可行**任务首个候选卷组（卷号从 0 起）的成绩**按批次冻结发布**：一次请求提交**任务、卷号、批次标识与考生标识名单**，服务端在**同一数据库快照**（单个 `BEGIN IMMEDIATE` 事务，进程内互斥锁串行化）内校验名单中**每名考生该卷的每道题都有有效分**（有效分口径与[录分](#有效分与待处理原因)完全一致），全部通过才在该事务内一次性冻结全批逐题有效分与总分；任一人缺评或待仲裁则**整批不发布、不写入任何批次数据**。
+
+请求体（`POST /api/tasks/{task_id}/papers/{paper}/publications`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batch_id` | 批次标识，**整数或非空字符串**；在**同一任务及同一卷内唯一**，整数 `1` 与字符串 `"1"` 是两个不同批次 |
+| `examinee_ids` | 考生标识列表，元素为整数或字符串（与录分同一编码口径，整数 42 与字符串 `"42"` 是两个不同考生）；**非空、不得重复**（按标识判重），否则 422 |
+
+未知字段、布尔/浮点等标识类型、空名单、重复考生均返回 **422**；任务不存在 **404**；任务未完成 / 结果不可行 / 卷号越界返回 **422**。
+
+### 发布成功（首次 201）
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/1/papers/0/publications \
+  -H "Content-Type: application/json" \
+  -d '{"batch_id": "2026-09-A", "examinee_ids": [42, "X7", 99]}'
+```
+
+```json
+{
+  "task_id": 1,
+  "paper": 0,
+  "batch_id": "2026-09-A",
+  "published_at": "2026-09-30T01:29:26Z",
+  "replayed": false,
+  "sheets": [
+    {"task_id": 1, "paper": 0, "examinee_id": 42,
+     "questions": [
+       {"question_id": 1, "effective_score": 4.5},
+       {"question_id": 2, "effective_score": 8}
+     ],
+     "total_score": 12.5},
+    {"task_id": 1, "paper": 0, "examinee_id": "X7",
+     "questions": [
+       {"question_id": 1, "effective_score": 5},
+       {"question_id": 2, "effective_score": 10}
+     ],
+     "total_score": 15}
+  ]
+}
+```
+
+- `sheets` 顺序与请求名单一致；每题只冻结发布口径下的 `question_id` 与 `effective_score`（差 1 的均值为 `x.5` 半分，分差 >1 取仲裁分），`total_score` 为逐题有效分之和；
+- 整数批次标识直接写 JSON 数字（`"batch_id": 7`）；字符串标识写 JSON 字符串（`"batch_id": "2026-09-A"`），查询路径中同样需 URL 编码（见下）。
+
+### 有人缺评或待仲裁（422，整批不发布）
+
+只要名单中**任一名**考生该卷有任一题没有有效分，整个批次都不会发布，响应逐人列出缺有效分的题号与原因（原因码同录分：`no_scores` / `missing_initial` / `missing_review` / `awaiting_arbitration`）；补评或仲裁落定后用**同一批次标识**重新请求即可：
+
+```json
+{
+  "detail": {
+    "message": "名单中存在缺评或待仲裁考生，整批未发布",
+    "code": "not_ready",
+    "blockers": [
+      {"examinee_id": 99, "questions": [
+        {"question_id": 1, "pending_reason": "missing_review",
+         "pending_message": "缺少复评，等待补评"},
+        {"question_id": 2, "pending_reason": "awaiting_arbitration",
+         "pending_message": "初评与复评分差超过 1 分，等待仲裁"}
+      ]}
+    ]
+  }
+}
+```
+
+### 相同批次重试（幂等 200 / 冲突 409）
+
+- **名单一致**（逐字节相同，含顺序）：原样返回冻结时的快照，HTTP **200**，`replayed: true`，`published_at` 与逐题分数均为首次发布时刻的值；
+- **名单不一致**（增减考生或顺序变化）：返回 **409**（`detail.code=batch_conflict`）并附已冻结名单 `stored_examinee_ids`，**历史批次不可改写**；要发布不同名单请使用新批次标识。
+
+```bash
+# 与首次请求完全相同 -> 200 {"replayed": true, ...原快照...}
+curl -X POST http://localhost:8000/api/tasks/1/papers/0/publications \
+  -H "Content-Type: application/json" \
+  -d '{"batch_id": "2026-09-A", "examinee_ids": [42, "X7", 99]}'
+
+# 名单不同 -> 409
+curl -X POST http://localhost:8000/api/tasks/1/papers/0/publications \
+  -H "Content-Type: application/json" \
+  -d '{"batch_id": "2026-09-A", "examinee_ids": [42, 7]}'
+# -> {"detail": {"message": "相同批次标识已发布且本次名单不一致：历史批次不可改写",
+#               "code": "batch_conflict", "stored_examinee_ids": [42, "X7", 99]}}
+```
+
+### 发布后改分不影响历史批次，新批次读最新成绩
+
+批次冻结的是**发布时刻**该快照内的逐题有效分与总分。发布之后录分侧的改分、撤销仲裁、重新仲裁**只影响新批次**：用新 `batch_id` 发布时读取当时的最新成绩；旧批次按原标识查询永远返回历史值。
+
+### 按批次查询（GET）
+
+`GET /api/tasks/{task_id}/papers/{paper}/publications/{batch}` 返回与发布一致的冻结快照（`replayed` 固定为 `false`）。路径中的批次标识与考生/题号同样以 JSON 编码区分类型：整数批次 `7` 直接写 `7`；字符串批次 `2026-09-A` 写 `%222026-A%22`（即 `"2026-09-A"` 的 URL 编码）。
+
+```bash
+# 字符串批次
+curl "http://localhost:8000/api/tasks/1/papers/0/publications/%222026-A%22"
+# 整数批次
+curl http://localhost:8000/api/tasks/1/papers/0/publications/7
+```
+
+- 任务不存在返回 **404**；任务未完成 / 结果不可行 / 卷号越界返回 **422**；
+- 任务与卷合法但**批次不存在**返回 **404**（`detail.code=batch_not_found`）。
+
+冻结数据持久化在 `score_publications`（批次头：标识、名单、冻结时刻）与 `score_publication_items`（逐考生完整成绩单快照）表中，随 SQLite 数据卷保留，服务/容器重启不丢失。
 
 ## 可行结果
 

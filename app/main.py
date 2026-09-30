@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import asynccontextmanager
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from . import database, scoring
@@ -18,6 +19,9 @@ from .schemas import (
     AuditEventOut,
     ExamTaskIn,
     PaperScoreSheetOut,
+    PublicationBlockedExamineeOut,
+    PublishedQuestionScoreOut,
+    PublishedSheetOut,
     QuotaConfirmIn,
     QuotaConfirmOut,
     QuotaLeaseOut,
@@ -29,6 +33,8 @@ from .schemas import (
     ReviewPlanOut,
     ReviseTaskIn,
     ScoreEntryIn,
+    ScoreBatchPublishIn,
+    ScorePublicationOut,
     SeatPlanIn,
     SeatPlanOut,
     TaskAuditOut,
@@ -63,7 +69,7 @@ app = FastAPI(
         "以及面向已完成且含 2~5 份平行卷的可行任务的考场卷别排布"
         "，以及面向已完成可行任务首个候选卷组的双评录分与仲裁"
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -858,3 +864,130 @@ def get_paper_scores(task_id: int, paper: int, examinee_raw: str) -> PaperScoreS
     papers, _ = _scorable_paper(task_id, paper)
     examinee_id = _decode_id(examinee_raw, "考生标识")
     return _build_sheet(task_id, paper, examinee_id, papers[paper])
+
+
+# --------------------------------------------------------------------------- #
+# 成绩批次发布：同快照全批校验、一次性冻结、幂等重试、按批次查询
+# --------------------------------------------------------------------------- #
+def _publication_out(snapshot: Dict[str, Any], replayed: bool) -> ScorePublicationOut:
+    """把冻结快照（含发布时组装的完整 sheet）转为发布结果模型。"""
+    sheets = [
+        PublishedSheetOut(
+            task_id=int(s["task_id"]),
+            paper=int(s["paper"]),
+            examinee_id=s["examinee_id"],
+            total_score=s["total_score"],
+            questions=[
+                PublishedQuestionScoreOut(
+                    question_id=q["question_id"],
+                    effective_score=q["effective_score"],
+                )
+                for q in s["questions"]
+            ],
+        )
+        for s in snapshot["sheets"]
+    ]
+    return ScorePublicationOut(
+        task_id=snapshot["task_id"],
+        paper=snapshot["paper"],
+        batch_id=snapshot["batch_id"],
+        published_at=snapshot["published_at"],
+        replayed=replayed,
+        sheets=sheets,
+    )
+
+
+@app.post(
+    "/api/tasks/{task_id}/papers/{paper}/publications",
+    response_model=ScorePublicationOut,
+    status_code=201,
+)
+def publish_score_batch(
+    task_id: int, paper: int, payload: ScoreBatchPublishIn
+):
+    """按批次发布某卷一批考生的成绩（首个候选卷组，冻结快照，幂等可重放）。
+
+    请求体给批次标识 ``batch_id``（整数或非空字符串，**同一任务及卷内唯一**，
+    整数与字符串严格区分）与考生标识名单 ``examinee_ids``（非空、不得重复；
+    整数 42 与字符串 "42" 是两个不同考生）。
+
+    在**同一数据库快照**（单事务 BEGIN IMMEDIATE）内检查名单中**每名**考生该卷
+    **每题都有有效分**（沿用录分口径：两评分齐备且分差 ≤1 取均值，分差 >1 取
+    仲裁分）：全部通过才在同一事务内一次性冻结全批逐题有效分与总分。
+
+    - 任一人缺评或待仲裁：返回 **422**（``detail.code=not_ready``），逐人列出
+      题号与待处理原因（no_scores / missing_initial / missing_review /
+      awaiting_arbitration），**整批不发布、不写入任何批次数据**；
+    - 相同批次重试且名单一致：**200** 返回原冻结快照（``replayed=true``）；
+    - 相同批次重试但名单不一致：**409**（``detail.code=batch_conflict``），
+      附已冻结名单，不改动历史批次；
+    - 发布成功返回 **201**（``replayed=false``）。此后改分/仲裁不影响本批次，
+      新批次在其发布时刻读取最新成绩。
+    - 任务不存在 404；任务未完成 / 结果不可行 / 卷号越界 / 空名单 / 重复考生
+      均返回 422。
+    """
+    # 卷可录分性与卷号越界校验复用录分同一入口（已完成且可行的首个候选卷组）
+    papers, _ = _scorable_paper(task_id, paper)
+    code, data = database.publish_score_batch(
+        task_id,
+        paper,
+        payload.batch_id,
+        list(payload.examinee_ids),
+        papers[paper],
+    )
+    if code == "conflict":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "相同批次标识已发布且本次名单不一致：历史批次不可改写",
+                "code": "batch_conflict",
+                "stored_examinee_ids": data["stored_roster"],
+            },
+        )
+    if code == "blocked":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "名单中存在缺评或待仲裁考生，整批未发布",
+                "code": "not_ready",
+                "blockers": [
+                    PublicationBlockedExamineeOut(**b).model_dump() for b in data
+                ],
+            },
+        )
+    result = _publication_out(data, replayed=(code == "replayed"))
+    if code == "replayed":
+        # 相同批次的一致重试：幂等返回原快照，用 200 与首次发布的 201 区分
+        return JSONResponse(status_code=200, content=result.model_dump())
+    return result
+
+
+@app.get(
+    "/api/tasks/{task_id}/papers/{paper}/publications/{batch_raw}",
+    response_model=ScorePublicationOut,
+)
+def get_score_publication(
+    task_id: int, paper: int, batch_raw: str
+) -> ScorePublicationOut:
+    """按批次查询冻结的发布结果（逐题有效分与总分，不随后续改分/仲裁变化）。
+
+    路径中的批次标识与考生/题号同样以 JSON 编码区分类型：整数批次 ``1`` 写作
+    ``1``，字符串批次 ``2026-A`` 写作 ``%222026-A%22``。
+
+    - 任务不存在返回 404；任务未完成 / 结果不可行 / 卷号越界返回 422；
+    - 批次不存在返回 404（``detail.code=batch_not_found``）。
+    """
+    # 仍校验任务与卷合法：不存在的任务/越界卷号不应被误报成“批次不存在”
+    _scorable_paper(task_id, paper)
+    batch_id = _decode_id(batch_raw, "批次标识")
+    snapshot = database.load_score_publication(task_id, paper, batch_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "批次不存在",
+                "code": "batch_not_found",
+                "batch_id": batch_id,
+            },
+        )
+    return _publication_out(snapshot, replayed=False)

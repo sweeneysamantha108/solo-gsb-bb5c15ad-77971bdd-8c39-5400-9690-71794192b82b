@@ -1101,3 +1101,132 @@ class PaperScoreSheetOut(BaseModel):
             "整卷总分：每题有效分求和；任一题尚无有效分（等待补评/仲裁）时为 null"
         ),
     )
+
+
+# --------------------------------------------------------------------------- #
+# 成绩批次发布：同一快照内全批校验通过才冻结逐题有效分与总分（幂等、可查）
+# --------------------------------------------------------------------------- #
+class ScoreBatchPublishIn(BaseModel):
+    """批次发布请求：批次标识 + 考生标识名单（整数/字符串严格区分）。
+
+    - ``batch_id``：批次标识，整数或非空字符串，同一任务及卷内唯一；
+    - ``examinee_ids``：考生标识名单，**非空且不得重复**（按 JSON 标识判重，
+      整数 42 与字符串 "42" 视为两个不同考生；布尔、浮点、数组等类型拒绝）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: ExamineeId = Field(
+        ..., description="批次标识（整数或非空字符串）；同一任务及卷内唯一"
+    )
+    examinee_ids: List[ExamineeId] = Field(
+        ..., description="本批考生标识列表；非空、不允许重复"
+    )
+
+    @field_validator("batch_id", mode="before")
+    @classmethod
+    def _batch_id_strict_type(cls, v: Any) -> Any:
+        # 在 Union[int, str] 胁迫前拒绝布尔/浮点等类型（1.5 不得被截成 1）
+        if isinstance(v, bool) or not isinstance(v, (int, str)):
+            raise ValueError(
+                f"batch_id 必须是整数或非空字符串（收到 {type(v).__name__}）"
+            )
+        return v
+
+    @field_validator("batch_id")
+    @classmethod
+    def _batch_id_valid(cls, v: ExamineeId) -> ExamineeId:
+        # bool 是 int 的子类，须先排除；字符串批次标识不允许空白串
+        if isinstance(v, bool) or not isinstance(v, (int, str)):
+            raise ValueError("batch_id 必须是整数或非空字符串")
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("batch_id 字符串批次标识不能为空")
+        return v
+
+    @field_validator("examinee_ids", mode="before")
+    @classmethod
+    def _examinee_ids_strict_types(cls, v: Any) -> Any:
+        # Union[int, str] 会把 JSON 浮点（1.5）/布尔先胁迫为 int，须在胁迫前拒绝；
+        # 必须是数组，元素只允许 int（排除 bool）或 str，保证整数与字符串严格区分
+        if not isinstance(v, list):
+            return v  # 交给 pydantic 报“不是列表”的标准 422
+        for x in v:
+            if isinstance(x, bool) or not isinstance(x, (int, str)):
+                raise ValueError(
+                    f"考生标识必须是整数或字符串（收到 {type(x).__name__}）；"
+                    "整数与字符串形式严格区分"
+                )
+        return v
+
+    @field_validator("examinee_ids")
+    @classmethod
+    def _examinee_ids_valid(cls, v: List[ExamineeId]) -> List[ExamineeId]:
+        if not v:
+            raise ValueError("考生名单不能为空")
+        # 按 JSON 存储键判重：整数 42 与字符串 "42" 不冲突，但同类型重复拒绝
+        seen: set[str] = set()
+        for x in v:
+            key = json.dumps(x, ensure_ascii=False)
+            if key in seen:
+                raise ValueError(f"考生名单中存在重复考生标识: {x!r}")
+            seen.add(key)
+        return v
+
+
+class PublishedQuestionScoreOut(BaseModel):
+    """冻结快照中的单题有效分（发布时刻口径，不随后续改分/仲裁变化）。"""
+
+    question_id: QuestionId
+    effective_score: Union[int, float] = Field(
+        ...,
+        description=(
+            "冻结的有效分：两评分差不超过 1 取均值（可能为 .5），分差超过 1 取仲裁分"
+        ),
+    )
+
+
+class PublishedSheetOut(BaseModel):
+    """批次内一名考生的冻结成绩单：逐题有效分 + 总分。"""
+
+    task_id: int
+    paper: int = Field(..., description="卷号（从 0 起，对应首个候选卷组的卷下标）")
+    examinee_id: ExamineeId
+    questions: List[PublishedQuestionScoreOut] = Field(
+        ..., description="逐题冻结有效分（按首个候选卷组 selected_ids 顺序）"
+    )
+    total_score: Union[int, float] = Field(
+        ..., description="冻结总分：发布时刻逐题有效分求和（可能为半分）"
+    )
+
+
+class ScorePublicationOut(BaseModel):
+    """批次发布/查询结果：批次标识、冻结时刻、本批逐考生有效分与总分。"""
+
+    task_id: int
+    paper: int
+    batch_id: ExamineeId = Field(..., description="批次标识（原样回显，整数与字符串严格区分）")
+    published_at: str = Field(
+        ..., description="冻结时刻（UTC ISO 8601，秒级，Z 结尾）"
+    )
+    replayed: bool = Field(
+        False, description="true 表示相同批次重试命中历史快照（幂等重放）"
+    )
+    sheets: List[PublishedSheetOut] = Field(..., description="本批每名考生的冻结成绩单")
+
+
+class PublicationBlockedQuestionOut(BaseModel):
+    """整批未发布时，某考生某题的阻塞原因（缺评/待仲裁）。"""
+
+    question_id: QuestionId
+    pending_reason: str = Field(
+        ...,
+        description="待处理原因码：no_scores / missing_initial / missing_review / awaiting_arbitration",
+    )
+    pending_message: str = Field(..., description="待处理原因的中文说明")
+
+
+class PublicationBlockedExamineeOut(BaseModel):
+    """整批未发布时的一名阻塞考生：该卷所有缺有效分的题目及原因。"""
+
+    examinee_id: ExamineeId
+    questions: List[PublicationBlockedQuestionOut]
